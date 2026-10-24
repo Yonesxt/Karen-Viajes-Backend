@@ -1,9 +1,10 @@
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
+import { config } from '../../../../lib/config.js'
 import { loginAccountLimiter as accountLimiter, loginIpLimiter as ipLimiter } from '../../../../lib/limiters.js'
 import { DUMMY_HASH, verifyPassword } from '../../../../lib/password.js'
-import { sessionCookie } from '../../../../lib/auth.js'
+import { issueToken, sessionCookie } from '../../../../lib/auth.js'
 import { findAdminByEmail } from '../../../../lib/repo/admins.js'
 import { HttpError, json, readJson, route } from '../../../../lib/http.js'
 
@@ -29,5 +30,7 @@ export const POST = route(async ({ request, ip }) => {
   if (!admin || !valid) throw new HttpError(401, 'E-mail o contraseña incorrectos.')
 
   accountLimiter.reset(accountKey)
-  return json({ email: admin.email, name: admin.name }, 200, { 'Set-Cookie': sessionCookie(admin) })
+  const result = { email: admin.email, name: admin.name }
+  if (config().allowBearer) result.token = issueToken(admin)
+  return json(result, 200, { 'Set-Cookie': sessionCookie(admin) })
 })
