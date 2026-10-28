@@ -62,6 +62,7 @@ test('CORS: solo orígenes permitidos', () => {
   const bad = buildCorsHeaders('https://malo.com', allowed)
   assert.equal(bad['Access-Control-Allow-Origin'], undefined)
   assert.equal(buildCorsHeaders(null, allowed)['Access-Control-Allow-Origin'], undefined)
+  assert.match(ok['Access-Control-Allow-Headers'], /Authorization/)
 })
 
 test('cookies: parseo básico', () => {
@@ -127,6 +128,24 @@ test('validación de viajes', () => {
   assert.ok(check({ from: '  ' }).from)
   assert.deepEqual(check({ includes: ['  Aéreo  ', '', 5] }), {})
   assert.deepEqual(normalizeTrip({ ...okTrip, includes: ['  Aéreo  ', '', 5] }).includes, ['Aéreo'])
+})
+
+test('validación de hotel y tour (fotos y descripción)', () => {
+  const h = (i) => `https://res.cloudinary.com/x/image/upload/v1/viajes-con-karen/${i}.jpg`
+  assert.deepEqual(check({ hotel: 'Hotel 4★', hotelImages: [h(1), h(2)], tour: 'City tour', tourImages: [h(3)] }), {})
+  assert.deepEqual(check({}), {}, 'todo es opcional')
+  assert.ok(check({ hotelImages: ['http://inseguro.com/a.jpg'] }).hotelImages, 'solo https')
+  assert.ok(check({ tourImages: ['data:image/png;base64,AAAA'] }).tourImages, 'sin data URLs')
+  assert.ok(check({ hotelImages: Array.from({ length: 11 }, (_, i) => h(i)) }).hotelImages, 'máximo 10')
+  assert.ok(check({ tourImages: 'https://a.com/a.jpg' }).tourImages, 'tiene que ser lista')
+  assert.ok(check({ tour: 'x'.repeat(2001) }).tour)
+  assert.ok(check({ hotel: 'x'.repeat(301) }).hotel)
+  const n = normalizeTrip({ ...okTrip, hotelImages: [h(1), h(1), ' ' + h(2) + ' '], tour: '  Paseo  ' })
+  assert.deepEqual(n.hotelImages, [h(1), h(2)], 'sin repetidos, recortadas y en orden')
+  assert.equal(n.tour, 'Paseo')
+  assert.deepEqual(normalizeTrip(okTrip).tourImages, [], 'si no vienen quedan vacías')
+  const f = normalizeTrip({ ...okTrip, category: 'vuelo', nights: null, airline: 'SKY', tripKind: 'Solo ida', hotel: 'x', hotelImages: [h(1)], tour: 'y', tourImages: [h(2)] })
+  assert.equal(f.hotel, null); assert.equal(f.tour, null); assert.deepEqual([f.hotelImages, f.tourImages], [[], []], 'un vuelo no lleva hotel ni tour')
 })
 
 test('validación de vuelos', () => {

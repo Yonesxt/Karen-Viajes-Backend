@@ -1,193 +1,467 @@
-import './helpers/setup.mjs'
+// Pruebas de punta a punta: llaman a los route.js reales contra un PostgreSQL real.
+import { call, cookieFrom, resetDatabase } from './helpers/setup.mjs'
 import assert from 'node:assert/strict'
-import { createHmac } from 'node:crypto'
-import { test } from 'node:test'
-import { signToken, verifyToken } from '../lib/jwt.js'
-import { hashPassword, verifyPassword } from '../lib/password.js'
-import { createLimiter } from '../lib/rateLimit.js'
-import { buildCorsHeaders } from '../lib/cors.js'
-import { parseCookies } from '../lib/auth.js'
-import { ALLOWED_FORMATS, createUploadSignature, deleteImage, publicIdFromUrl, signParams } from '../lib/cloudinary.js'
-import { hasErrors, isDate, normalizeDestination, normalizeInquiry, normalizeTrip, validateDestination, validateInquiry, validateOffer, validateTrip } from '../lib/validation.js'
+import { before, describe, test } from 'node:test'
+import { hashPassword } from '../lib/password.js'
+import { upsertAdmin } from '../lib/repo/admins.js'
+import { seedCatalog } from '../lib/seed.js'
+import { psqlQuery } from './helpers/psql-adapter.mjs'
 
-test('JWT: firma, verifica, detecta alteraciones, vencimiento y alg=none', () => {
-  const t = signToken({ sub: 1, email: 'a@b.com' }, { expiresInSec: 60 })
-  assert.equal(verifyToken(t).email, 'a@b.com')
-  const [h, b, s] = t.split('.')
-  const evil = Buffer.from(JSON.stringify({ sub: 2, email: 'x@y.com', exp: 9999999999 })).toString('base64url')
-  assert.equal(verifyToken(`${h}.${evil}.${s}`), null, 'payload alterado')
-  assert.equal(verifyToken(`${h}.${b}.${s.slice(0, -2)}AA`), null, 'firma alterada')
-  assert.equal(verifyToken(signToken({ sub: 1 }, { expiresInSec: -10 })), null, 'vencido')
-  const none = `${Buffer.from('{"alg":"none"}').toString('base64url')}.${b}.`
-  assert.equal(verifyToken(none), null, 'alg none')
-  const otherKey = createHmac('sha256', 'otra-clave-distinta-otra-clave-distinta').update(`${h}.${b}`).digest('base64url')
-  assert.equal(verifyToken(`${h}.${b}.${otherKey}`), null, 'otra clave')
-  assert.equal(verifyToken('basura'), null)
-  assert.equal(verifyToken(undefined), null)
-})
-
-test('JWT: sin secreto o muy corto se rechaza', () => {
-  const old = process.env.JWT_SECRET
-  process.env.JWT_SECRET = 'corto'
-  assert.throws(() => signToken({}, { expiresInSec: 5 }), /JWT_SECRET/)
-  process.env.JWT_SECRET = old
-})
-
-test('contraseñas: hash distinto cada vez, verifica bien y mal', async () => {
-  const h1 = await hashPassword('Contraseña-Larga-1')
-  const h2 = await hashPassword('Contraseña-Larga-1')
-  assert.notEqual(h1, h2)
-  assert.match(h1, /^scrypt\$16384\$8\$1\$/)
-  assert.equal(await verifyPassword('Contraseña-Larga-1', h1), true)
-  assert.equal(await verifyPassword('contraseña-larga-1', h1), false)
-  assert.equal(await verifyPassword('x', 'formato-invalido'), false)
-})
-
-test('limitador: bloquea al pasar el máximo y se libera con la ventana', () => {
-  const l = createLimiter({ max: 2, windowMs: 1000 })
-  assert.equal(l.hit('a', 0).ok, true)
-  assert.equal(l.hit('a', 1).ok, true)
-  const third = l.hit('a', 2)
-  assert.equal(third.ok, false)
-  assert.ok(third.retryAfterSec >= 1)
-  assert.equal(l.hit('b', 2).ok, true)
-  assert.equal(l.hit('a', 1500).ok, true)
-})
-
-test('CORS: solo orígenes permitidos', () => {
-  const allowed = ['http://localhost:5173']
-  const ok = buildCorsHeaders('http://localhost:5173', allowed)
-  assert.equal(ok['Access-Control-Allow-Origin'], 'http://localhost:5173')
-  assert.equal(ok['Access-Control-Allow-Credentials'], 'true')
-  const bad = buildCorsHeaders('https://malo.com', allowed)
-  assert.equal(bad['Access-Control-Allow-Origin'], undefined)
-  assert.equal(buildCorsHeaders(null, allowed)['Access-Control-Allow-Origin'], undefined)
-  assert.match(ok['Access-Control-Allow-Headers'], /Authorization/)
-})
-
-test('cookies: parseo básico', () => {
-  assert.deepEqual(parseCookies('a=1; vck_session=abc.def; b=%20x'), { a: '1', vck_session: 'abc.def', b: ' x' })
-  assert.deepEqual(parseCookies(null), {})
-})
-
-test('Cloudinary: la firma coincide con el ejemplo de la documentación oficial', () => {
-  const sig = signParams({ eager: 'w_400,h_300,c_pad|w_260,h_200,c_crop', public_id: 'sample_image', timestamp: 1315060510 }, 'abcd')
-  assert.equal(sig, 'bfd09f95f331f558cbd1320e67aa8d488770583e')
-})
-
-test('Cloudinary: firma de subida e id público de las imágenes', async () => {
-  Object.assign(process.env, { CLOUDINARY_CLOUD_NAME: 'micloud', CLOUDINARY_API_KEY: '123', CLOUDINARY_API_SECRET: 'secreto', CLOUDINARY_FOLDER: 'viajes-con-karen' })
-  const s = createUploadSignature(1_700_000_000_000)
-  assert.equal(s.timestamp, 1_700_000_000)
-  assert.equal(s.uploadUrl, 'https://api.cloudinary.com/v1_1/micloud/image/upload')
-  assert.equal(s.signature, signParams({ allowed_formats: ALLOWED_FORMATS, folder: 'viajes-con-karen', timestamp: 1_700_000_000 }, 'secreto'))
-  assert.equal(s.apiSecret, undefined, 'el secreto nunca sale')
-
-  assert.equal(publicIdFromUrl('https://res.cloudinary.com/micloud/image/upload/v169/viajes-con-karen/abc123.jpg'), 'viajes-con-karen/abc123')
-  assert.equal(publicIdFromUrl('https://res.cloudinary.com/micloud/image/upload/viajes-con-karen/sub/x.webp'), 'viajes-con-karen/sub/x')
-  assert.equal(publicIdFromUrl('https://res.cloudinary.com/otro/image/upload/v1/viajes-con-karen/a.jpg'), null, 'otra cuenta')
-  assert.equal(publicIdFromUrl('https://res.cloudinary.com/micloud/image/upload/v1/otra-carpeta/a.jpg'), null, 'otra carpeta')
-  assert.equal(publicIdFromUrl('https://ejemplo.com/foto.jpg'), null)
-  assert.equal(publicIdFromUrl('https://res.cloudinary.com/micloud/image/upload/v1/viajes-con-karen/../x/a.jpg'), null, 'traversal')
-
-  let sent
-  const ok = await deleteImage('https://res.cloudinary.com/micloud/image/upload/v1/viajes-con-karen/a.jpg', async (url, init) => {
-    sent = { url, body: Object.fromEntries(init.body) }
-    return { ok: true }
-  })
-  assert.equal(ok, true)
-  assert.equal(sent.url, 'https://api.cloudinary.com/v1_1/micloud/image/destroy')
-  assert.equal(sent.body.public_id, 'viajes-con-karen/a')
-  assert.equal(sent.body.signature, signParams({ public_id: 'viajes-con-karen/a', timestamp: sent.body.timestamp }, 'secreto'))
-  assert.equal(await deleteImage('https://ejemplo.com/a.jpg', async () => assert.fail('no debe llamar')), false)
-  for (const k of ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET']) delete process.env[k]
-})
-
-const okTrip = {
-  category: 'paquete', destinationId: 1, title: 'Caribe', summary: 'Una semana en el Caribe.', currency: 'USD', price: 1000,
-  nights: 7, departure: '2027-05-01', from: 'Buenos Aires', includes: ['Aéreo'], hotel: null, offer: null,
+const r = {
+  health: (await import('../app/api/health/route.js')),
+  login: (await import('../app/api/auth/login/route.js')),
+  logout: (await import('../app/api/auth/logout/route.js')),
+  me: (await import('../app/api/auth/me/route.js')),
+  catalogo: (await import('../app/api/catalogo/route.js')),
+  viajes: (await import('../app/api/viajes/route.js')),
+  viaje: (await import('../app/api/viajes/[id]/route.js')),
+  estado: (await import('../app/api/viajes/[id]/estado/route.js')),
+  oferta: (await import('../app/api/viajes/[id]/oferta/route.js')),
+  duplicar: (await import('../app/api/viajes/[id]/duplicar/route.js')),
+  destinos: (await import('../app/api/destinos/route.js')),
+  destino: (await import('../app/api/destinos/[id]/route.js')),
+  firma: (await import('../app/api/imagenes/firma/route.js')),
+  consultas: (await import('../app/api/consultas/route.js')),
+  consulta: (await import('../app/api/consultas/[id]/route.js')),
 }
-const check = (over, dest = true) => validateTrip(normalizeTrip({ ...okTrip, ...over }), { destinationExists: () => dest })
 
-test('validación de viajes', () => {
-  assert.deepEqual(check({}), {})
-  assert.ok(check({ category: 'auto' }).category)
-  assert.ok(check({}, false).destinationId)
-  assert.ok(check({ destinationId: '1' }).destinationId, 'el id tiene que ser número')
-  assert.ok(check({ title: 'ab' }).title)
-  assert.ok(check({ title: 'x'.repeat(121) }).title)
-  assert.ok(check({ currency: 'EUR' }).currency)
-  assert.ok(check({ price: 10.5 }).price)
-  assert.ok(check({ price: '1000' }).price, 'precio como texto no se acepta')
-  assert.ok(check({ price: 3_000_000_000 }).price)
-  assert.ok(check({ departure: '2027-02-30' }).departure)
-  assert.ok(check({ departure: '01/05/2027' }).departure)
-  assert.ok(check({ includes: [' ', ''] }).includes)
-  assert.ok(check({ nights: 0 }).nights)
-  assert.ok(check({ nights: null }).nights)
-  assert.ok(check({ from: '  ' }).from)
-  assert.deepEqual(check({ includes: ['  Aéreo  ', '', 5] }), {})
-  assert.deepEqual(normalizeTrip({ ...okTrip, includes: ['  Aéreo  ', '', 5] }).includes, ['Aéreo'])
+const EMAIL = 'karen@viajesconkaren.com'
+const PASS = 'Clave-Segura-123'
+let cookie
+
+const validTrip = (over = {}) => ({
+  category: 'paquete', destinationId: 1, title: 'Prueba Caribe', summary: 'Un viaje de prueba largo.', currency: 'USD', price: 1000,
+  nights: 5, departure: '2027-05-01', from: 'Buenos Aires', includes: ['Traslados'], hotel: null, offer: null, active: true, ...over,
+})
+const as = (extra = {}) => ({ cookie, ...extra })
+
+before(async () => {
+  resetDatabase()
+  await seedCatalog()
+  await upsertAdmin({ email: EMAIL, name: 'Karen', passwordHash: await hashPassword(PASS) })
 })
 
-test('validación de vuelos', () => {
-  const flight = { category: 'vuelo', nights: null, airline: 'SKY', tripKind: 'Ida y vuelta' }
-  assert.deepEqual(check(flight), {})
-  assert.ok(check({ ...flight, nights: 3 }).nights)
-  assert.ok(check({ ...flight, airline: '' }).airline)
-  assert.ok(check({ ...flight, tripKind: '' }).tripKind)
-  const t = normalizeTrip({ ...okTrip, ...flight, hotel: 'no debería' })
-  assert.equal(t.hotel, null, 'un vuelo no guarda hotel')
-  assert.equal(normalizeTrip(okTrip).airline, null, 'un paquete no guarda aerolínea')
+describe('base y datos de ejemplo', () => {
+  test('health', async () => {
+    const res = await call(r.health.GET)
+    assert.equal(res.status, 200)
+    assert.deepEqual(res.data, { ok: true })
+  })
+  test('el seed cargó 18 destinos y 22 viajes y no se repite', async () => {
+    const [{ d, t }] = await psqlQuery('SELECT (SELECT count(*) FROM destinations)::int AS d, (SELECT count(*) FROM trips)::int AS t')
+    assert.equal(d, 18); assert.equal(t, 22)
+    assert.deepEqual(await seedCatalog(), { skipped: true })
+  })
 })
 
-test('validación de ofertas', () => {
-  assert.deepEqual(validateOffer(null, 100), {})
-  assert.ok(validateOffer({ type: 'discount', price: 100 }, 100).offerPrice)
-  assert.ok(validateOffer({ type: 'discount', price: 99.5 }, 100).offerPrice)
-  assert.deepEqual(validateOffer({ type: 'discount', price: 90, until: '2027-01-31' }, 100), {})
-  assert.ok(validateOffer({ type: 'promo', label: '' }, 100).offerLabel)
-  assert.ok(validateOffer({ type: 'promo', label: 'x'.repeat(17) }, 100).offerLabel)
-  assert.deepEqual(validateOffer({ type: 'promo', label: '2x1', note: 'Viajan dos' }, 100), {})
-  assert.ok(validateOffer({ type: 'raro' }, 100).offerType)
-  assert.ok(check({ offer: 'texto' }).offerType)
-  assert.ok(check({ offer: { type: 'discount', price: 5000 } }).offerPrice)
-  assert.ok(validateOffer({ type: 'promo', label: '2x1', until: '2027-13-01' }, 100).offerUntil)
+describe('sesión', () => {
+  test('rutas protegidas sin sesión dan 401', async () => {
+    for (const [h, opts] of [
+      [r.me.GET, {}], [r.viajes.POST, { method: 'POST', body: validTrip() }], [r.destinos.GET, {}], [r.consultas.GET, {}],
+      [r.firma.POST, { method: 'POST', body: {} }], [r.estado.PATCH, { method: 'PATCH', body: { active: false }, params: { id: '1' } }],
+      [r.destino.DELETE, { method: 'DELETE', params: { id: '1' } }],
+    ]) {
+      const res = await call(h, opts)
+      assert.equal(res.status, 401, JSON.stringify(opts).slice(0, 60))
+    }
+  })
+
+  test('login incorrecto: mismo mensaje con e-mail inexistente o clave mala', async () => {
+    const a = await call(r.login.POST, { method: 'POST', body: { email: EMAIL, password: 'mala-mala-mala' }, ip: '1.1.1.1' })
+    const b = await call(r.login.POST, { method: 'POST', body: { email: 'nadie@x.com', password: 'mala-mala-mala' }, ip: '1.1.1.2' })
+    assert.equal(a.status, 401); assert.equal(b.status, 401)
+    assert.equal(a.data.error, b.data.error)
+    assert.match(a.data.error, /incorrectos/)
+  })
+
+  test('login correcto: cookie httpOnly y /me', async () => {
+    const res = await call(r.login.POST, { method: 'POST', body: { email: ` ${EMAIL.toUpperCase()} `, password: PASS }, ip: '1.1.1.3' })
+    assert.equal(res.status, 200)
+    assert.deepEqual(res.data, { email: EMAIL, name: 'Karen' })
+    const setCookie = res.headers.get('set-cookie')
+    assert.match(setCookie, /^vck_session=/)
+    assert.match(setCookie, /HttpOnly/)
+    assert.match(setCookie, /SameSite=Lax/)
+    assert.match(setCookie, /Max-Age=604800/)
+    assert.doesNotMatch(JSON.stringify(res.data), /hash|password/i)
+    cookie = cookieFrom(res)
+    const me = await call(r.me.GET, as())
+    assert.equal(me.status, 200); assert.equal(me.data.email, EMAIL)
+  })
+
+  test('una cookie falsificada no sirve', async () => {
+    const res = await call(r.me.GET, { cookie: 'vck_session=aaa.bbb.ccc' })
+    assert.equal(res.status, 401)
+  })
+
+  test('freno de fuerza bruta: 429 tras varios intentos fallidos (con Retry-After)', async () => {
+    let last
+    for (let i = 0; i < 10; i++) last = await call(r.login.POST, { method: 'POST', body: { email: EMAIL, password: `mala-${i}-mala` }, ip: '9.9.9.9' })
+    assert.equal(last.status, 429)
+    assert.ok(Number(last.headers.get('retry-after')) > 0)
+    // aun con la clave correcta, desde esa IP queda bloqueado
+    const blocked = await call(r.login.POST, { method: 'POST', body: { email: EMAIL, password: PASS }, ip: '9.9.9.9' })
+    assert.equal(blocked.status, 429)
+  })
+
+  test('seguridad de pedidos: origen no permitido (403) y body que no es JSON (415/400)', async () => {
+    const evil = await call(r.viajes.POST, as({ method: 'POST', body: validTrip(), origin: 'https://malo.com' }))
+    assert.equal(evil.status, 403)
+    const form = await call(r.viajes.POST, as({ method: 'POST', body: 'a=1', headers: { 'content-type': 'application/x-www-form-urlencoded' } }))
+    assert.equal(form.status, 415)
+    const broken = await call(r.viajes.POST, as({ method: 'POST', body: '{no es json' }))
+    assert.equal(broken.status, 400)
+    const arr = await call(r.viajes.POST, as({ method: 'POST', body: '[1,2]' }))
+    assert.equal(arr.status, 400)
+    const huge = await call(r.viajes.POST, as({ method: 'POST', body: JSON.stringify({ title: 'x'.repeat(200_000) }) }))
+    assert.equal(huge.status, 413)
+    // sin Origin (curl/servidor) sí se acepta mientras haya sesión
+    const noOrigin = await call(r.me.GET, as({ origin: null }))
+    assert.equal(noOrigin.status, 200)
+  })
 })
 
-test('fechas', () => {
-  assert.equal(isDate('2028-02-29'), true)
-  assert.equal(isDate('2027-02-29'), false)
-  assert.equal(isDate('2027-2-1'), false)
-  assert.equal(isDate(20270101), false)
+describe('token Bearer (alternativa a la cookie)', () => {
+  const creds = { email: EMAIL, password: PASS }
+  test('por defecto está desactivado: el login no devuelve token y el header se ignora', async () => {
+    const res = await call(r.login.POST, { method: 'POST', body: creds, ip: '5.5.5.1' })
+    assert.equal(res.data.token, undefined)
+    const me = await call(r.me.GET, { headers: { authorization: 'Bearer ' + cookie.split('=')[1] } })
+    assert.equal(me.status, 401)
+  })
+  test('con ALLOW_BEARER_TOKEN=true el login devuelve token y sirve sin cookie', async () => {
+    process.env.ALLOW_BEARER_TOKEN = 'true'
+    try {
+      const res = await call(r.login.POST, { method: 'POST', body: creds, ip: '5.5.5.2' })
+      assert.match(res.data.token, /^[\w-]+\.[\w-]+\.[\w-]+$/)
+      assert.match(res.headers.get('set-cookie'), /^vck_session=/, 'la cookie se sigue enviando')
+      const me = await call(r.me.GET, { headers: { authorization: `Bearer ${res.data.token}` } })
+      assert.equal(me.status, 200); assert.equal(me.data.email, EMAIL)
+      assert.equal((await call(r.me.GET, { headers: { authorization: 'Bearer basura.basura.basura' } })).status, 401)
+      assert.equal((await call(r.me.GET, { headers: { authorization: 'Basic abc' } })).status, 401)
+    } finally {
+      delete process.env.ALLOW_BEARER_TOKEN
+    }
+  })
 })
 
-test('validación de destinos e imágenes', () => {
-  const v = (b) => validateDestination(normalizeDestination(b))
-  const base = { name: 'Kioto', country: 'Japón', scope: 'internacional', images: [] }
-  assert.deepEqual(v(base), {})
-  assert.deepEqual(v({ ...base, images: ['https://res.cloudinary.com/x/a.jpg'] }), {})
-  assert.ok(v({ ...base, images: ['http://inseguro.com/a.jpg'] }).images, 'solo https')
-  assert.ok(v({ ...base, images: ['data:image/png;base64,AAAA'] }).images, 'sin data URLs')
-  assert.ok(v({ ...base, images: ['javascript:alert(1)'] }).images)
-  assert.ok(v({ ...base, images: Array.from({ length: 21 }, (_, i) => `https://a.com/${i}.jpg`) }).images)
-  assert.ok(v({ ...base, images: 'https://a.com/a.jpg' }).images)
-  assert.ok(v({ ...base, name: 'K' }).name)
-  assert.ok(v({ ...base, scope: 'luna' }).scope)
-  assert.ok(v({ ...base, country: '' }).country)
-  assert.deepEqual(normalizeDestination({ ...base, images: ['https://a.com/1.jpg', 'https://a.com/1.jpg', 'https://a.com/2.jpg'] }).images, ['https://a.com/1.jpg', 'https://a.com/2.jpg'])
+describe('catálogo público y de admin', () => {
+  test('el público solo ve viajes activos; el admin ve todo', async () => {
+    const created = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Oculto', active: false }) }))
+    assert.equal(created.status, 201)
+    const pub = await call(r.catalogo.GET)
+    assert.equal(pub.status, 200)
+    assert.ok(!pub.data.trips.some((t) => t.title === 'Oculto'))
+    assert.equal(pub.data.trips.length, 22)
+    assert.match(pub.headers.get('cache-control'), /s-maxage/)
+    const adm = await call(r.catalogo.GET, as())
+    assert.ok(adm.data.trips.some((t) => t.title === 'Oculto'))
+    assert.equal(adm.data.trips.length, 23)
+    assert.equal(adm.data.destinations.length, 18)
+    assert.match(adm.headers.get('cache-control'), /no-store/)
+  })
+
+  test('el formato de los viajes es el que espera el front', async () => {
+    const { data } = await call(r.catalogo.GET)
+    const flight = data.trips.find((t) => t.category === 'vuelo')
+    assert.equal(flight.nights, null)
+    assert.equal(typeof flight.airline, 'string'); assert.equal(typeof flight.tripKind, 'string')
+    assert.match(flight.departure, /^\d{4}-\d{2}-\d{2}$/)
+    assert.match(flight.createdAt, /^\d{4}-\d{2}-\d{2}T.*Z$/)
+    const pkg = data.trips.find((t) => t.category === 'paquete')
+    assert.equal('airline' in pkg, false)
+    assert.ok(Array.isArray(pkg.includes) && typeof pkg.from === 'string' && typeof pkg.destinationId === 'number')
+    const withOffer = data.trips.find((t) => t.offer?.type === 'discount')
+    assert.equal(typeof withOffer.offer.price, 'number')
+    assert.ok(data.destinations.every((d) => Array.isArray(d.images) && d.scope))
+  })
 })
 
-test('validación de consultas', () => {
-  const v = (b) => validateInquiry(normalizeInquiry(b))
-  assert.deepEqual(v({ name: 'Ana', email: 'ana@x.com', message: 'Hola' }), {})
-  assert.deepEqual(v({ name: 'Ana', phone: '+54 9 11 5555-5555', message: 'Hola' }), {})
-  assert.ok(v({ name: '', message: '' }).name)
-  assert.ok(v({ name: 'Ana', message: 'Hola' }).contact)
-  assert.ok(v({ name: 'Ana', email: 'no-mail', message: 'Hola' }).email)
-  assert.ok(v({ name: 'Ana', phone: 'abc', message: 'Hola' }).phone)
-  assert.ok(v({ name: 'Ana', email: 'a@b.com', message: 'x'.repeat(4001) }).message)
-  const n = normalizeInquiry({ name: 'A', source: 'hack', channel: 'paloma', tripId: '5' })
-  assert.equal(n.source, 'web'); assert.equal(n.channel, 'formulario'); assert.equal(n.tripId, null)
-  assert.equal(hasErrors({}), false)
+describe('viajes', () => {
+  let id
+  test('crear: válido (201), con id nuevo continuando el seed', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip() }))
+    assert.equal(res.status, 201)
+    assert.equal(res.data.id, 24)
+    assert.equal(res.data.active, true); assert.equal(res.data.offer, null); assert.equal(res.data.from, 'Buenos Aires')
+    id = res.data.id
+  })
+  test('crear: errores por campo (422)', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: '', price: -1, destinationId: 999, offer: { type: 'discount', price: 5000 }, includes: [] }) }))
+    assert.equal(res.status, 422)
+    for (const k of ['title', 'price', 'destinationId', 'includes', 'offerPrice']) assert.ok(res.data.fields[k], k)
+  })
+  test('crear vuelo: sin aerolínea falla, con datos completos funciona y no guarda noches', async () => {
+    const bad = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ category: 'vuelo', nights: null }) }))
+    assert.ok(bad.data.fields.airline && bad.data.fields.tripKind)
+    const ok = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ category: 'vuelo', nights: null, airline: 'SKY', tripKind: 'Ida y vuelta', title: 'Vuelo prueba' }) }))
+    assert.equal(ok.status, 201); assert.equal(ok.data.nights, null); assert.equal(ok.data.airline, 'SKY')
+  })
+  test('editar conserva createdAt y cambia updatedAt', async () => {
+    const before = await call(r.viaje.GET, as({ params: { id: String(id) } }))
+    await new Promise((res) => setTimeout(res, 20))
+    const res = await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(id) }, body: validTrip({ title: 'Editado', price: 1500 }) }))
+    assert.equal(res.status, 200)
+    assert.equal(res.data.title, 'Editado'); assert.equal(res.data.price, 1500)
+    assert.equal(res.data.createdAt, before.data.createdAt)
+    assert.notEqual(res.data.updatedAt, before.data.updatedAt)
+  })
+  test('editar: viaje inexistente 404; id inválido 404; validación 422', async () => {
+    assert.equal((await call(r.viaje.PUT, as({ method: 'PUT', params: { id: '99999' }, body: validTrip() }))).status, 404)
+    assert.equal((await call(r.viaje.PUT, as({ method: 'PUT', params: { id: 'abc' }, body: validTrip() }))).status, 404)
+    assert.equal((await call(r.viaje.PUT, as({ method: 'PUT', params: { id: "1; DROP TABLE trips" }, body: validTrip() }))).status, 404)
+    assert.equal((await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(id) }, body: validTrip({ title: 'x' }) }))).status, 422)
+  })
+  test('desactivar y reactivar (no se borra)', async () => {
+    const off = await call(r.estado.PATCH, as({ method: 'PATCH', params: { id: String(id) }, body: { active: false } }))
+    assert.equal(off.data.active, false)
+    const pub = await call(r.catalogo.GET)
+    assert.ok(!pub.data.trips.some((t) => t.id === id))
+    const on = await call(r.estado.PATCH, as({ method: 'PATCH', params: { id: String(id) }, body: { active: true } }))
+    assert.equal(on.data.active, true)
+    assert.equal((await call(r.estado.PATCH, as({ method: 'PATCH', params: { id: String(id) }, body: { active: 'si' } }))).status, 422)
+    assert.equal((await call(r.estado.PATCH, as({ method: 'PATCH', params: { id: '99999' }, body: { active: true } }))).status, 404)
+  })
+  test('ofertas: descuento, promo, inválidas y quitar', async () => {
+    const p = { id: String(id) }
+    const d = await call(r.oferta.PUT, as({ method: 'PUT', params: p, body: { type: 'discount', price: 1200, until: '2027-01-31' } }))
+    assert.equal(d.status, 200); assert.deepEqual(d.data.offer, { type: 'discount', price: 1200, until: '2027-01-31' })
+    const pr = await call(r.oferta.PUT, as({ method: 'PUT', params: p, body: { type: 'promo', label: '2x1', note: 'Viajan dos' } }))
+    assert.deepEqual(pr.data.offer, { type: 'promo', label: '2x1', note: 'Viajan dos' })
+    const bad = await call(r.oferta.PUT, as({ method: 'PUT', params: p, body: { type: 'discount', price: 1600 } }))
+    assert.equal(bad.status, 422); assert.ok(bad.data.fields.offerPrice)
+    assert.ok((await call(r.oferta.PUT, as({ method: 'PUT', params: p, body: { type: 'promo', label: '' } }))).data.fields.offerLabel)
+    assert.equal((await call(r.oferta.PUT, as({ method: 'PUT', params: { id: '99999' }, body: { type: 'promo', label: '2x1' } }))).status, 404)
+    const wrapped = await call(r.oferta.PUT, as({ method: 'PUT', params: p, body: { offer: { type: 'promo', label: '3x2' } } }))
+    assert.equal(wrapped.data.offer.label, '3x2')
+    const off = await call(r.oferta.DELETE, as({ method: 'DELETE', params: p }))
+    assert.equal(off.data.offer, null)
+  })
+  test('duplicar: copia desactivada, sin oferta y con "(copia)"', async () => {
+    await call(r.oferta.PUT, as({ method: 'PUT', params: { id: String(id) }, body: { type: 'promo', label: '3x2' } }))
+    const res = await call(r.duplicar.POST, as({ method: 'POST', params: { id: String(id) } }))
+    assert.equal(res.status, 201)
+    assert.equal(res.data.active, false); assert.equal(res.data.offer, null)
+    assert.match(res.data.title, /\(copia\)$/)
+    assert.notEqual(res.data.id, id)
+    assert.equal((await call(r.duplicar.POST, as({ method: 'POST', params: { id: '99999' } }))).status, 404)
+  })
+  test('las comillas y caracteres raros se guardan tal cual (consultas parametrizadas)', async () => {
+    const title = `Ushuaia "Fin del Mundo" — O'Brien; DROP TABLE trips; --`
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title, includes: ['Comida "gourmet"', "Guía d'élite", 'Ñandú \\ barra'] }) }))
+    assert.equal(res.status, 201)
+    assert.equal(res.data.title, title)
+    assert.deepEqual(res.data.includes, ['Comida "gourmet"', "Guía d'élite", 'Ñandú \\ barra'])
+    const [{ n }] = await psqlQuery('SELECT count(*)::int AS n FROM trips')
+    assert.ok(n > 22)
+  })
+})
+
+describe('hotel y tour', () => {
+  const img = (n) => `https://res.cloudinary.com/micloud/image/upload/v1/viajes-con-karen/${n}.jpg`
+  let id
+  test('crear con fotos de hotel y tour: se guardan en orden y vuelven en el catálogo', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Con hotel y tour', hotel: 'Hotel 4★ frente al mar', hotelImages: [img('h2'), img('h1')], tour: 'City tour de medio día', tourImages: [img('t1')] }) }))
+    assert.equal(res.status, 201)
+    assert.deepEqual(res.data.hotelImages, [img('h2'), img('h1')])
+    assert.equal(res.data.tour, 'City tour de medio día'); assert.deepEqual(res.data.tourImages, [img('t1')])
+    id = res.data.id
+    const pub = await call(r.catalogo.GET)
+    const t = pub.data.trips.find((x) => x.id === id)
+    assert.deepEqual(t.hotelImages, [img('h2'), img('h1')]); assert.equal(t.hotel, 'Hotel 4★ frente al mar')
+  })
+  test('los viajes del seed (anteriores a esto) tienen listas vacías y sin tour', async () => {
+    const t = (await call(r.catalogo.GET)).data.trips.find((x) => x.id === 1)
+    assert.deepEqual(t.hotelImages, []); assert.deepEqual(t.tourImages, []); assert.equal(t.tour, null)
+  })
+  test('editar: agregar, reordenar y quitar fotos; el tour se puede vaciar', async () => {
+    const res = await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(id) }, body: validTrip({ title: 'Con hotel y tour', hotel: 'Hotel', hotelImages: [img('h1')], tour: '', tourImages: [] }) }))
+    assert.equal(res.status, 200)
+    assert.deepEqual(res.data.hotelImages, [img('h1')]); assert.equal(res.data.tour, null); assert.deepEqual(res.data.tourImages, [])
+  })
+  test('validación: links no https, más de 10 y tour muy largo dan 422 por campo', async () => {
+    const bad = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ hotelImages: ['http://x.com/a.jpg'], tourImages: Array.from({ length: 11 }, (_, i) => img(i)), tour: 'x'.repeat(2001) }) }))
+    assert.equal(bad.status, 422)
+    for (const k of ['hotelImages', 'tourImages', 'tour']) assert.ok(bad.data.fields[k], k)
+  })
+  test('un vuelo ignora hotel y tour', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ category: 'vuelo', nights: null, airline: 'SKY', tripKind: 'Solo ida', title: 'Vuelo sin extras', hotel: 'no', hotelImages: [img('x')], tour: 'no', tourImages: [img('y')] }) }))
+    assert.equal(res.status, 201)
+    assert.equal(res.data.hotel, null); assert.equal(res.data.tour, null); assert.deepEqual([res.data.hotelImages, res.data.tourImages], [[], []])
+  })
+  test('el esquema también impide un vuelo con hotel o tour', async () => {
+    await assert.rejects(
+      psqlQuery(`INSERT INTO trips (category, destination_id, title, summary, currency, price, departure, origin, airline, trip_kind, tour)
+                 VALUES ('vuelo', 1, 'xxx', 'resumen largo ok', 'USD', 10, '2027-01-01', 'BA', 'SKY', 'Solo ida', 'tour') RETURNING id`),
+      (e) => e.code === '23514'
+    )
+  })
+  test('duplicar copia las fotos del hotel y del tour', async () => {
+    await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(id) }, body: validTrip({ title: 'Con hotel y tour', hotelImages: [img('h1')], tour: 'Tour', tourImages: [img('t1'), img('t2')] }) }))
+    const copy = await call(r.duplicar.POST, as({ method: 'POST', params: { id: String(id) } }))
+    assert.deepEqual(copy.data.hotelImages, [img('h1')]); assert.equal(copy.data.tour, 'Tour'); assert.deepEqual(copy.data.tourImages, [img('t1'), img('t2')])
+  })
+  test('limpieza en Cloudinary (activada): borra solo lo que ya nadie usa', async () => {
+    Object.assign(process.env, { CLOUDINARY_CLOUD_NAME: 'micloud', CLOUDINARY_API_KEY: '1', CLOUDINARY_API_SECRET: 's', CLOUDINARY_DELETE_ORPHANS: 'true' })
+    const realFetch = globalThis.fetch
+    const deleted = []
+    globalThis.fetch = async (url, init) => { deleted.push(new URLSearchParams(init.body).get('public_id')); return { ok: true } }
+    try {
+      const dest = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Limpieza', country: 'X', scope: 'nacional', images: [img('d1'), img('shared')] } }))
+      const trip = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: dest.data.id, title: 'Viaje de limpieza', hotelImages: [img('shared'), img('h9')], tourImages: [img('t9')] }) }))
+      // se saca h9 del hotel y t9 del tour; "shared" sigue en uso por el destino
+      await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(trip.data.id) }, body: validTrip({ destinationId: dest.data.id, title: 'Viaje de limpieza', hotelImages: [img('shared')], tourImages: [] }) }))
+      assert.deepEqual(deleted.sort(), ['viajes-con-karen/h9', 'viajes-con-karen/t9'])
+      deleted.length = 0
+      // al sacar "shared" y "d1" del destino: d1 se borra; shared NO (la usa el hotel del viaje)
+      await call(r.destino.PUT, as({ method: 'PUT', params: { id: String(dest.data.id) }, body: { name: 'Limpieza', country: 'X', scope: 'nacional', images: [] } }))
+      assert.deepEqual(deleted, ['viajes-con-karen/d1'])
+    } finally {
+      globalThis.fetch = realFetch
+      for (const k of ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET', 'CLOUDINARY_DELETE_ORPHANS']) delete process.env[k]
+    }
+  })
+})
+
+describe('destinos', () => {
+  let id
+  test('crear y rechazar nombre repetido (sin importar mayúsculas)', async () => {
+    const res = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Kioto', country: 'Japón', scope: 'internacional', images: ['https://res.cloudinary.com/x/a.jpg'] } }))
+    assert.equal(res.status, 201); id = res.data.id
+    assert.deepEqual(res.data.images, ['https://res.cloudinary.com/x/a.jpg'])
+    const dup = await call(r.destinos.POST, as({ method: 'POST', body: { name: ' kioto ', country: 'Japón', scope: 'internacional' } }))
+    assert.equal(dup.status, 422); assert.ok(dup.data.fields.name)
+  })
+  test('imágenes: se rechazan links no https, data URLs y scripts', async () => {
+    for (const bad of ['http://x.com/a.jpg', 'data:image/png;base64,AAAA', 'javascript:alert(1)', 'no-es-link']) {
+      const res = await call(r.destino.PUT, as({ method: 'PUT', params: { id: String(id) }, body: { name: 'Kioto', country: 'Japón', scope: 'internacional', images: [bad] } }))
+      assert.equal(res.status, 422, bad); assert.ok(res.data.fields.images)
+    }
+  })
+  test('editar: el orden de las imágenes se conserva (la primera es la portada)', async () => {
+    const imgs = ['https://a.com/2.jpg', 'https://a.com/1.jpg', 'https://a.com/3.jpg']
+    const res = await call(r.destino.PUT, as({ method: 'PUT', params: { id: String(id) }, body: { name: 'Kioto', country: 'Japón', scope: 'internacional', images: imgs } }))
+    assert.equal(res.status, 200); assert.deepEqual(res.data.images, imgs)
+    const dup = await call(r.destino.PUT, as({ method: 'PUT', params: { id: String(id) }, body: { name: 'Tokio', country: 'Japón', scope: 'internacional', images: [] } }))
+    assert.equal(dup.status, 422)
+    assert.equal((await call(r.destino.PUT, as({ method: 'PUT', params: { id: '99999' }, body: { name: 'Nuevo', country: 'X', scope: 'nacional', images: [] } }))).status, 404)
+  })
+  test('dos viajes comparten las imágenes de su destino', async () => {
+    const t1 = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: id, title: 'Kioto paquete' }) }))
+    const t2 = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: id, title: 'Kioto hotel', category: 'hotel' }) }))
+    assert.equal(t1.status, 201); assert.equal(t2.status, 201)
+    const cat = await call(r.catalogo.GET)
+    assert.equal(cat.data.trips.filter((t) => t.destinationId === id).length, 2)
+    assert.equal(cat.data.destinations.find((d) => d.id === id).images.length, 3)
+  })
+  test('no se elimina un destino con viajes (409), aunque estén desactivados', async () => {
+    const res = await call(r.destino.DELETE, as({ method: 'DELETE', params: { id: String(id) } }))
+    assert.equal(res.status, 409); assert.match(res.data.error, /viajes asociados/)
+    const viajes = (await call(r.catalogo.GET, as())).data.trips.filter((t) => t.destinationId === id)
+    for (const t of viajes) await call(r.estado.PATCH, as({ method: 'PATCH', params: { id: String(t.id) }, body: { active: false } }))
+    assert.equal((await call(r.destino.DELETE, as({ method: 'DELETE', params: { id: String(id) } }))).status, 409)
+  })
+  test('el destino sin viajes activos no aparece en el catálogo público', async () => {
+    const pub = await call(r.catalogo.GET)
+    assert.ok(!pub.data.destinations.some((d) => d.id === id))
+  })
+  test('un destino sin viajes sí se elimina; uno inexistente da 404', async () => {
+    const nuevo = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Temporal', country: 'X', scope: 'nacional' } }))
+    assert.deepEqual((await call(r.destino.DELETE, as({ method: 'DELETE', params: { id: String(nuevo.data.id) } }))).data, { id: nuevo.data.id })
+    assert.equal((await call(r.destino.DELETE, as({ method: 'DELETE', params: { id: String(nuevo.data.id) } }))).status, 404)
+  })
+  test('listar destinos (admin)', async () => {
+    const res = await call(r.destinos.GET, as())
+    assert.ok(res.data.length >= 19)
+  })
+})
+
+describe('imágenes (Cloudinary)', () => {
+  test('sin configurar: 503', async () => {
+    const res = await call(r.firma.POST, as({ method: 'POST', body: {} }))
+    assert.equal(res.status, 503)
+  })
+  test('configurado: devuelve firma y nunca el secreto', async () => {
+    Object.assign(process.env, { CLOUDINARY_CLOUD_NAME: 'micloud', CLOUDINARY_API_KEY: '123456', CLOUDINARY_API_SECRET: 'super-secreto' })
+    const res = await call(r.firma.POST, as({ method: 'POST', body: {} }))
+    assert.equal(res.status, 200)
+    assert.equal(res.data.folder, 'viajes-con-karen'); assert.match(res.data.signature, /^[0-9a-f]{40}$/)
+    assert.doesNotMatch(JSON.stringify(res.data), /super-secreto/)
+    for (const k of ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET']) delete process.env[k]
+  })
+})
+
+describe('consultas', () => {
+  let id
+  const body = (over = {}) => ({ name: 'Ana Pérez', email: 'ana@x.com', phone: '', message: 'Quiero info del viaje', source: 'detalle', channel: 'formulario', tripId: 1, ...over })
+
+  test('público: se puede enviar sin sesión; el título del viaje sale de la base', async () => {
+    const res = await call(r.consultas.POST, { method: 'POST', body: body({ tripTitle: 'TÍTULO FALSO' }), ip: '2.2.2.2', cookie: undefined })
+    assert.equal(res.status, 201)
+    assert.equal(res.data.status, 'nueva')
+    assert.equal(res.data.tripId, 1)
+    assert.notEqual(res.data.tripTitle, 'TÍTULO FALSO'); assert.ok(res.data.tripTitle)
+    id = res.data.id
+  })
+  test('un viaje inexistente se ignora (no rompe)', async () => {
+    const res = await call(r.consultas.POST, { method: 'POST', body: body({ tripId: 99999 }), ip: '2.2.2.3' })
+    assert.equal(res.status, 201); assert.equal(res.data.tripId, null); assert.equal(res.data.tripTitle, null)
+  })
+  test('validación (422) y consulta de modal sin viaje', async () => {
+    const bad = await call(r.consultas.POST, { method: 'POST', body: { name: '', message: '' }, ip: '2.2.2.4' })
+    assert.equal(bad.status, 422); assert.ok(bad.data.fields.name && bad.data.fields.message)
+    const noContact = await call(r.consultas.POST, { method: 'POST', body: { name: 'Ana', message: 'Hola' }, ip: '2.2.2.4' })
+    assert.ok(noContact.data.fields.contact)
+    const modal = await call(r.consultas.POST, { method: 'POST', body: { name: 'Beto', phone: '+54 9 11 5555-5555', message: 'Luna de miel', subject: 'Japón', source: 'modal', channel: 'whatsapp' }, ip: '2.2.2.4' })
+    assert.equal(modal.status, 201); assert.equal(modal.data.channel, 'whatsapp'); assert.equal(modal.data.subject, 'Japón')
+  })
+  test('antispam: máximo 6 por IP en 10 minutos', async () => {
+    let last
+    for (let i = 0; i < 8; i++) last = await call(r.consultas.POST, { method: 'POST', body: body(), ip: '3.3.3.3' })
+    assert.equal(last.status, 429)
+    assert.ok(Number(last.headers.get('retry-after')) > 0)
+  })
+  test('solo el admin las lista, cambia de estado y borra', async () => {
+    assert.equal((await call(r.consultas.GET)).status, 401)
+    assert.equal((await call(r.consulta.PATCH, { method: 'PATCH', params: { id: String(id) }, body: { status: 'atendida' } })).status, 401)
+    const list = await call(r.consultas.GET, as())
+    assert.ok(list.data.length >= 3)
+    assert.ok(list.data[0].createdAt >= list.data[list.data.length - 1].createdAt, 'más nuevas primero')
+    const upd = await call(r.consulta.PATCH, as({ method: 'PATCH', params: { id: String(id) }, body: { status: 'atendida' } }))
+    assert.equal(upd.data.status, 'atendida')
+    assert.equal((await call(r.consulta.PATCH, as({ method: 'PATCH', params: { id: String(id) }, body: { status: 'otro' } }))).status, 422)
+    assert.equal((await call(r.consulta.PATCH, as({ method: 'PATCH', params: { id: '99999' }, body: { status: 'nueva' } }))).status, 404)
+    assert.deepEqual((await call(r.consulta.DELETE, as({ method: 'DELETE', params: { id: String(id) } }))).data, { id })
+    assert.equal((await call(r.consulta.DELETE, as({ method: 'DELETE', params: { id: String(id) } }))).status, 404)
+  })
+  test('si se borra el viaje de la consulta, la consulta queda (FK SET NULL)', async () => {
+    const res = await call(r.consultas.POST, { method: 'POST', body: body({ tripId: 2 }), ip: '4.4.4.4' })
+    await psqlQuery('DELETE FROM trips WHERE id = $1 RETURNING id', [2])
+    const list = await call(r.consultas.GET, as())
+    const found = list.data.find((x) => x.id === res.data.id)
+    assert.equal(found.tripId, null); assert.ok(found.tripTitle)
+  })
+})
+
+describe('logout y cierre', () => {
+  test('logout limpia la cookie', async () => {
+    const res = await call(r.logout.POST, as({ method: 'POST', body: {} }))
+    assert.equal(res.status, 200)
+    assert.match(res.headers.get('set-cookie'), /Max-Age=0/)
+  })
+  test('el esquema impide datos incoherentes aunque se salte la API', async () => {
+    await assert.rejects(
+      psqlQuery(`INSERT INTO trips (category, destination_id, title, summary, currency, price, nights, departure, origin)
+                 VALUES ('vuelo', 1, 'xxx', 'resumen largo ok', 'USD', 10, 3, '2027-01-01', 'BA') RETURNING id`),
+      (e) => e.code === '23514'
+    )
+  })
+  test('seed --force vacía y recarga', async () => {
+    const res = await seedCatalog({ force: true })
+    assert.equal(res.trips, 22)
+    const [{ t, s }] = await psqlQuery('SELECT (SELECT count(*) FROM trips)::int AS t, (SELECT count(*) FROM inquiries)::int AS s')
+    assert.equal(t, 22); assert.equal(s, 0)
+    const next = await psqlQuery(`SELECT nextval(pg_get_serial_sequence('trips','id')) AS n`)
+    assert.equal(Number(next[0].n), 23)
+  })
 })
