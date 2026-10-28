@@ -1,3 +1,4 @@
+import { readdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setQueryImpl } from '../../lib/db.js'
@@ -19,7 +20,9 @@ export function resetDatabase() {
   // Las pruebas BORRAN todo el esquema: solo se permite en bases cuyo nombre termina en _test.
   if (!/_test$/.test(TEST_DB)) throw new Error(`Por seguridad las pruebas solo corren en una base que termine en _test (actual: ${TEST_DB}).`)
   psql(['-c', 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'])
-  runFile(resolve(root, 'db/migrations/001_init.sql'))
+  // todas las migraciones, en orden (001_init, 002_hotel_tour, ...)
+  const dir = resolve(root, 'db/migrations')
+  for (const f of readdirSync(dir).filter((n) => n.endsWith('.sql')).sort()) runFile(resolve(dir, f))
 }
 
 // Llama a un handler de ruta como lo haría Next (Request estándar -> Response).
