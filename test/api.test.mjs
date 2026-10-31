@@ -20,6 +20,7 @@ const r = {
   duplicar: (await import('../app/api/viajes/[id]/duplicar/route.js')),
   destinos: (await import('../app/api/destinos/route.js')),
   destino: (await import('../app/api/destinos/[id]/route.js')),
+  ajustes: (await import('../app/api/ajustes/route.js')),
   firma: (await import('../app/api/imagenes/firma/route.js')),
   consultas: (await import('../app/api/consultas/route.js')),
   consulta: (await import('../app/api/consultas/[id]/route.js')),
@@ -254,6 +255,32 @@ describe('viajes', () => {
     assert.deepEqual(res.data.includes, ['Comida "gourmet"', "Guía d'élite", 'Ñandú \\ barra'])
     const [{ n }] = await psqlQuery('SELECT count(*)::int AS n FROM trips')
     assert.ok(n > 22)
+  })
+})
+
+describe('ajustes (viajes por página)', () => {
+  test('el catálogo público trae el valor por defecto (20)', async () => {
+    const res = await call(r.catalogo.GET)
+    assert.deepEqual(res.data.settings, { tripsPerPage: 20 })
+  })
+  test('solo el admin lo lee y lo cambia', async () => {
+    assert.equal((await call(r.ajustes.GET)).status, 401)
+    assert.equal((await call(r.ajustes.PUT, { method: 'PUT', body: { tripsPerPage: 8 } })).status, 401)
+  })
+  test('cambiar: se guarda y el catálogo público lo refleja', async () => {
+    const res = await call(r.ajustes.PUT, as({ method: 'PUT', body: { tripsPerPage: 8 } }))
+    assert.deepEqual(res.data, { tripsPerPage: 8 })
+    assert.equal((await call(r.catalogo.GET)).data.settings.tripsPerPage, 8)
+    assert.equal((await call(r.ajustes.GET, as())).data.tripsPerPage, 8)
+  })
+  test('valores inválidos dan 422 y no cambian nada', async () => {
+    for (const bad of [0, 3, 101, 12.5, '20', null, undefined, -5]) {
+      const res = await call(r.ajustes.PUT, as({ method: 'PUT', body: { tripsPerPage: bad } }))
+      assert.equal(res.status, 422, String(bad)); assert.ok(res.data.fields.tripsPerPage)
+    }
+    assert.equal((await call(r.catalogo.GET)).data.settings.tripsPerPage, 8)
+    for (const ok of [4, 100]) assert.equal((await call(r.ajustes.PUT, as({ method: 'PUT', body: { tripsPerPage: ok } }))).status, 200)
+    await call(r.ajustes.PUT, as({ method: 'PUT', body: { tripsPerPage: 20 } }))
   })
 })
 
