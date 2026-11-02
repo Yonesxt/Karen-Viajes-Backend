@@ -258,6 +258,22 @@ describe('viajes', () => {
   })
 })
 
+describe('viaje en el día (0 noches)', () => {
+  test('crear y editar con 0 noches; -1 se rechaza', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Excursión de un día', nights: 0 }) }))
+    assert.equal(res.status, 201); assert.strictEqual(res.data.nights, 0)
+    const upd = await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(res.data.id) }, body: validTrip({ title: 'Excursión de un día', nights: 0, price: 50 }) }))
+    assert.strictEqual(upd.data.nights, 0)
+    assert.equal((await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ nights: -1 }) }))).status, 422)
+    const pub = (await call(r.catalogo.GET)).data.trips.find((t) => t.id === res.data.id)
+    assert.strictEqual(pub.nights, 0)
+  })
+  test('el esquema acepta 0 pero no negativos', async () => {
+    await assert.rejects(psqlQuery(`INSERT INTO trips (category, destination_id, title, summary, currency, price, nights, departure, origin)
+      VALUES ('paquete', 1, 'xxx', 'resumen largo ok', 'USD', 10, -1, '2027-01-01', 'BA') RETURNING id`), (e) => e.code === '23514')
+  })
+})
+
 describe('ajustes (viajes por página)', () => {
   test('el catálogo público trae el valor por defecto (20)', async () => {
     const res = await call(r.catalogo.GET)
