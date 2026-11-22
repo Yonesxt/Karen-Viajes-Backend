@@ -24,6 +24,8 @@ const r = {
   firma: (await import('../app/api/imagenes/firma/route.js')),
   consultas: (await import('../app/api/consultas/route.js')),
   consulta: (await import('../app/api/consultas/[id]/route.js')),
+  stats: (await import('../app/api/estadisticas/route.js')),
+  evento: (await import('../app/api/estadisticas/evento/route.js')),
 }
 
 const EMAIL = 'karen@viajesconkaren.com'
@@ -483,6 +485,129 @@ describe('consultas', () => {
     const list = await call(r.consultas.GET, as())
     const found = list.data.find((x) => x.id === res.data.id)
     assert.equal(found.tripId, null); assert.ok(found.tripTitle)
+  })
+})
+
+
+describe('varias fechas de salida y viajes vencidos', () => {
+  let multiId, expiredId
+  test('crear con varias fechas: se ordenan, sin repetidos, y "departure" es la primera', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Multi fecha', departure: undefined, departures: ['2027-09-10', '2027-03-05', '2027-03-05', '2027-06-01'] }) }))
+    assert.equal(res.status, 201)
+    assert.deepEqual(res.data.departures, ['2027-03-05', '2027-06-01', '2027-09-10'])
+    assert.equal(res.data.departure, '2027-03-05')
+    multiId = res.data.id
+  })
+  test('compatibilidad: solo "departure" = una sola fecha', async () => {
+    const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Una fecha', departure: '2027-07-07' }) }))
+    assert.equal(res.status, 201)
+    assert.deepEqual(res.data.departures, ['2027-07-07'])
+  })
+  test('validación: sin fechas, inválidas, demasiadas o no-lista', async () => {
+    for (const departures of [[], ['2027-02-30'], ['hoy'], Array.from({ length: 25 }, (_, i) => `2027-01-${String(i + 1).padStart(2, '0')}`), 'x']) {
+      const res = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ departure: undefined, departures }) }))
+      assert.equal(res.status, 422, JSON.stringify(departures))
+      assert.ok(res.data.fields.departures)
+    }
+  })
+  test('editar reemplaza las fechas', async () => {
+    const res = await call(r.viaje.PUT, as({ method: 'PUT', params: { id: String(multiId) }, body: validTrip({ title: 'Multi fecha', departure: undefined, departures: ['2027-12-24'] }) }))
+    assert.equal(res.status, 200)
+    assert.deepEqual(res.data.departures, ['2027-12-24'])
+    assert.equal(res.data.departure, '2027-12-24')
+  })
+  test('duplicar copia las fechas', async () => {
+    const res = await call(r.duplicar.POST, as({ method: 'POST', params: { id: String(multiId) }, body: {} }))
+    assert.deepEqual(res.data.departures, ['2027-12-24'])
+  })
+  test('el público no ve fechas pasadas; el viaje sin fechas futuras desaparece; el panel lo sigue viendo', async () => {
+    const mixed = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Mixto', departure: undefined, departures: ['2020-01-01', '2027-02-02'] }) }))
+    const old = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Solo pasado', departure: undefined, departures: ['2020-01-01', '2021-05-05'] }) }))
+    expiredId = old.data.id
+    const pub = await call(r.catalogo.GET)
+    const m = pub.data.trips.find((t) => t.id === mixed.data.id)
+    assert.deepEqual(m.departures, ['2027-02-02'])
+    assert.equal(m.departure, '2027-02-02')
+    assert.equal(pub.data.trips.find((t) => t.id === expiredId), undefined, 'vencido oculto al público')
+    const adm = await call(r.catalogo.GET, as())
+    assert.deepEqual(adm.data.trips.find((t) => t.id === mixed.data.id).departures, ['2020-01-01', '2027-02-02'])
+    assert.ok(adm.data.trips.find((t) => t.id === expiredId), 'el panel lo ve')
+  })
+  test('un destino que solo tenía viajes vencidos deja de aparecer al público', async () => {
+    const dest = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Solo vencido', country: 'Chile', scope: 'internacional', images: [] } }))
+    await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: dest.data.id, title: 'Vencido del destino', departure: undefined, departures: ['2020-03-03'] }) }))
+    const pub = await call(r.catalogo.GET)
+    assert.equal(pub.data.destinations.find((d) => d.id === dest.data.id), undefined)
+  })
+  test('la salida de hoy sigue vigente (zona horaria de Argentina)', async () => {
+    const { publicTrips, todayAR } = await import('../lib/repo/trips.js')
+    // 22:30 en Argentina del 10/05 ya es 01:30 UTC del 11/05: igual es "hoy" el 10/05
+    assert.equal(todayAR(new Date('2027-05-11T01:30:00Z')), '2027-05-10')
+    const out = publicTrips([{ departures: ['2027-05-10'] }, { departures: ['2027-05-09'] }], '2027-05-10')
+    assert.equal(out.length, 1)
+  })
+  test('migración: el esquema completa "departures" si falta y la limita a 1-24', async () => {
+    const rows = await psqlQuery(`INSERT INTO trips (category, destination_id, title, summary, currency, price, nights, departure, origin)
+                 VALUES ('paquete', 1, 'sin array', 'resumen largo ok', 'USD', 10, 3, '2027-01-01', 'BA') RETURNING departures`)
+    assert.equal(rows.length, 1)
+    await assert.rejects(
+      psqlQuery(`UPDATE trips SET departures = ARRAY[]::date[] WHERE id = $1 RETURNING id`, [multiId]).then((x) => { if (!x.length) throw new Error('x'); return x }).then(async () => {
+        const [row] = await psqlQuery('SELECT cardinality(departures)::int AS n FROM trips WHERE id = $1', [multiId])
+        if (row.n < 1) throw Object.assign(new Error('vacío'), { code: '23514' })
+        throw Object.assign(new Error('ok'), { code: 'OK' })
+      }),
+      (e) => e.code === 'OK'
+    )
+  })
+})
+
+describe('estadísticas', () => {
+  const ev = (body, extra = {}) => call(r.evento.POST, { method: 'POST', body, ip: '7.7.7.7', headers: { 'user-agent': 'Mozilla/5.0 (X11) Chrome' }, ...extra })
+  test('cuenta vistas y WhatsApp de un viaje activo', async () => {
+    assert.equal((await ev({ tripId: 1, kind: 'view' })).data.counted, true)
+    assert.equal((await ev({ tripId: 1, kind: 'view' })).data.counted, true)
+    assert.equal((await ev({ tripId: 1, kind: 'whatsapp' })).data.counted, true)
+  })
+  test('no cuenta: robots, administración, viaje inexistente o desactivado', async () => {
+    assert.equal((await ev({ tripId: 1, kind: 'view' }, { headers: { 'user-agent': 'Googlebot/2.1' } })).data.counted, false)
+    assert.equal((await ev({ tripId: 1, kind: 'view' }, { cookie })).data.counted, false)
+    assert.equal((await ev({ tripId: 99999, kind: 'view' })).data.counted, false)
+    const off = await call(r.estado.PATCH, as({ method: 'PATCH', params: { id: '3' }, body: { active: false } }))
+    assert.equal(off.status, 200)
+    assert.equal((await ev({ tripId: 3, kind: 'view' })).data.counted, false)
+  })
+  test('rechaza eventos inválidos', async () => {
+    for (const b of [{}, { tripId: 'a', kind: 'view' }, { tripId: 1, kind: 'otro' }, { tripId: -1, kind: 'view' }, { tripId: 1.5, kind: 'view' }]) {
+      assert.equal((await ev(b)).status, 422, JSON.stringify(b))
+    }
+  })
+  test('límite por IP', async () => {
+    let last
+    for (let i = 0; i < 125; i++) last = await ev({ tripId: 1, kind: 'view' }, { ip: '8.8.8.8' })
+    assert.equal(last.status, 429)
+  })
+  test('el resumen requiere sesión y suma bien', async () => {
+    assert.equal((await call(r.stats.GET)).status, 401)
+    await call(r.consultas.POST, { method: 'POST', body: { name: 'Ana', email: 'a@b.com', phone: '', subject: '', message: 'hola', tripId: 1, source: 'detalle', channel: 'formulario' }, ip: '9.9.9.9' })
+    const res = await call(r.stats.GET, as({ url: 'http://localhost:3000/api/estadisticas?dias=7' }))
+    assert.equal(res.status, 200)
+    assert.equal(res.data.days, 7)
+    assert.equal(res.data.series.length, 7)
+    assert.equal(res.data.totals.views, 122, '2 de antes + 120 que dejó pasar el límite')
+    assert.equal(res.data.totals.whatsapp, 1)
+    assert.ok(res.data.totals.inquiries >= 1)
+    const t1 = res.data.trips.find((t) => t.tripId === 1)
+    assert.equal(t1.views, 122); assert.equal(t1.whatsapp, 1); assert.ok(t1.inquiries >= 1)
+    assert.equal(res.data.inquiriesByMonth.length, 12)
+    assert.ok(res.data.inquiriesByMonth.at(-1).count >= 1)
+    assert.equal(JSON.stringify(res.data).includes('7.7.7.7'), false, 'no se guarda ni se devuelve la IP')
+    const bad = await call(r.stats.GET, as({ url: 'http://localhost:3000/api/estadisticas?dias=5' }))
+    assert.equal(bad.data.days, 30, 'período inválido -> 30')
+  })
+  test('al borrar el viaje se borran sus contadores', async () => {
+    await psqlQuery('DELETE FROM trips WHERE id = $1 RETURNING id', [1])
+    const [{ n }] = await psqlQuery('SELECT count(*)::int AS n FROM trip_stats_daily WHERE trip_id = 1')
+    assert.equal(n, 0)
   })
 })
 
