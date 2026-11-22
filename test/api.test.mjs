@@ -26,6 +26,8 @@ const r = {
   consulta: (await import('../app/api/consultas/[id]/route.js')),
   stats: (await import('../app/api/estadisticas/route.js')),
   evento: (await import('../app/api/estadisticas/evento/route.js')),
+  compartir: (await import('../app/api/compartir/[id]/route.js')),
+  sitemap: (await import('../app/api/sitemap/route.js')),
 }
 
 const EMAIL = 'karen@viajesconkaren.com'
@@ -608,6 +610,63 @@ describe('estadísticas', () => {
     await psqlQuery('DELETE FROM trips WHERE id = $1 RETURNING id', [1])
     const [{ n }] = await psqlQuery('SELECT count(*)::int AS n FROM trip_stats_daily WHERE trip_id = 1')
     assert.equal(n, 0)
+  })
+})
+
+
+describe('compartir (vista previa) y sitemap', () => {
+  const share = (id) => call(r.compartir.GET, { url: `http://localhost:3000/api/compartir/${id}`, params: { id: String(id) }, origin: null })
+  let destId, tripId
+  test('la página de un viaje trae sus etiquetas Open Graph y redirige a la web', async () => {
+    const dest = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Destino Share', country: 'Chile', scope: 'internacional', images: ['https://res.cloudinary.com/demo/image/upload/v1/viajes/foto.jpg'] } }))
+    destId = dest.data.id
+    const t = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: destId, title: 'Chile "<b>mágico</b>" & más', summary: 'Resumen del viaje para compartir.', departure: undefined, departures: ['2027-04-01', '2027-08-01'], price: 1500 }) }))
+    tripId = t.data.id
+    const res = await share(tripId)
+    assert.equal(res.status, 200)
+    assert.match(res.headers.get('content-type'), /text\/html/)
+    const body = res.data
+    assert.match(body, /<meta property="og:title" content="Chile &quot;&lt;b&gt;mágico&lt;\/b&gt;&quot; &amp; más – Destino Share, Chile \| Viajes con Karen">/)
+    assert.match(body, /og:description" content="[^"]*2 fechas de salida \(próxima 01\/04\/2027\)[^"]*Desde USD 1\.500/)
+    assert.match(body, /og:image" content="https:\/\/res\.cloudinary\.com\/demo\/image\/upload\/c_fill,g_auto,w_1200,h_630,q_auto:good,f_jpg\/v1\/viajes\/foto\.jpg"/)
+    assert.match(body, /og:image:width" content="1200"/)
+    assert.match(body, new RegExp(`og:url" content="http://localhost:3000/api/compartir/${tripId}"`))
+    assert.match(body, new RegExp(`window\\.location\\.replace\\("http://localhost:5173/viaje/${tripId}"\\)`))
+    assert.match(body, /twitter:card" content="summary_large_image"/)
+    assert.doesNotMatch(body, /<b>mágico<\/b>/, 'el texto del viaje va escapado')
+    assert.match(res.headers.get('cache-control'), /s-maxage/)
+  })
+  test('sin foto usa la imagen por defecto; oferta y promo se reflejan en el texto', async () => {
+    const dest = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Sin Foto', country: 'Perú', scope: 'internacional', images: [] } }))
+    const t = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: dest.data.id, title: 'Perú oferta', offer: { type: 'discount', price: 800 }, price: 1000 }) }))
+    const body = (await share(t.data.id)).data
+    assert.match(body, /og:image" content="http:\/\/localhost:5173\/og-default\.jpg"/)
+    assert.match(body, /Oferta USD 800 \(antes USD 1\.000\)/)
+    const p = await call(r.oferta.PUT, as({ method: 'PUT', params: { id: String(t.data.id) }, body: { type: 'promo', label: '2x1' } }))
+    assert.equal(p.status, 200)
+    assert.match((await share(t.data.id)).data, /Promo 2x1 · desde USD 1\.000/)
+  })
+  test('viaje inexistente, id inválido, desactivado o vencido: tarjeta general de la agencia', async () => {
+    const off = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Apagado', active: false }) }))
+    const old = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Viejo', departure: undefined, departures: ['2020-01-01'] }) }))
+    for (const id of [999999, 'abc', off.data.id, old.data.id]) {
+      const res = await share(id)
+      assert.equal(res.status, 200)
+      assert.match(res.data, /og:title" content="Viajes con Karen \|/)
+      assert.match(res.data, /replace\("http:\/\/localhost:5173\/"\)/)
+      assert.doesNotMatch(res.data, /Apagado|Viejo/)
+    }
+  })
+  test('sitemap: portada y viajes publicados (sin desactivados ni vencidos)', async () => {
+    const res = await call(r.sitemap.GET, { origin: null })
+    assert.equal(res.status, 200)
+    assert.match(res.headers.get('content-type'), /application\/xml/)
+    assert.match(res.data, /<loc>http:\/\/localhost:5173\/<\/loc>/)
+    assert.match(res.data, new RegExp(`<loc>http://localhost:5173/viaje/${tripId}</loc><lastmod>\\d{4}-\\d{2}-\\d{2}</lastmod>`))
+    const adm = await call(r.catalogo.GET, as())
+    const hidden = adm.data.trips.filter((t) => !t.active || t.departures.every((d) => d < '2026-01-01'))
+    assert.ok(hidden.length >= 2)
+    for (const t of hidden) assert.doesNotMatch(res.data, new RegExp(`/viaje/${t.id}<`))
   })
 })
 
