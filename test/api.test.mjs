@@ -28,6 +28,8 @@ const r = {
   evento: (await import('../app/api/estadisticas/evento/route.js')),
   compartir: (await import('../app/api/compartir/[id]/route.js')),
   sitemap: (await import('../app/api/sitemap/route.js')),
+  disponibilidad: (await import('../app/api/viajes/[id]/disponibilidad/route.js')),
+  pagina: (await import('../app/api/pagina/viaje/[id]/route.js')),
 }
 
 const EMAIL = 'karen@viajesconkaren.com'
@@ -667,6 +669,93 @@ describe('compartir (vista previa) y sitemap', () => {
     const hidden = adm.data.trips.filter((t) => !t.active || t.departures.every((d) => d < '2026-01-01'))
     assert.ok(hidden.length >= 2)
     for (const t of hidden) assert.doesNotMatch(res.data, new RegExp(`/viaje/${t.id}<`))
+  })
+})
+
+
+describe('disponibilidad y página del viaje con vista previa en la dirección de la web', () => {
+  const SHELL = `<!doctype html><html lang="es-AR"><head><meta charset="UTF-8" />
+<title>Viajes con Karen | General</title>
+<meta name="description" content="general" />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="https://x.y/" />
+<meta property="og:title" content="general" />
+<meta property="og:image" content="https://x.y/og-default.jpg" />
+<meta name="twitter:title" content="general" />
+<script type="module" crossorigin src="/assets/index-abc123.js"></script></head>
+<body><div id="root"></div></body></html>`
+  const avail = (id) => call(r.disponibilidad.GET, { params: { id: String(id) }, origin: null })
+  const page = (id) => call(r.pagina.GET, { params: { id: String(id) }, origin: null })
+  let okId, offId, oldId, shareId
+  const realFetch = globalThis.fetch
+  let fetchCalls = 0
+  test('estados: ok, vencido (con título), desactivado y no existe (sin revelar nada)', async () => {
+    const dest = await call(r.destinos.POST, as({ method: 'POST', body: { name: 'Destino Pagina', country: 'Chile', scope: 'internacional', images: ['https://res.cloudinary.com/demo/image/upload/v1/viajes/foto.jpg'] } }))
+    shareId = (await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ destinationId: dest.data.id, title: 'Chile "<b>mágico</b>" & más', summary: 'Resumen del viaje para compartir.' }) }))).data.id
+    okId = (await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Disponible OK' }) }))).data.id
+    oldId = (await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Cartel Vencido', departure: undefined, departures: ['2020-02-02'] }) }))).data.id
+    offId = (await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Secreto Apagado', active: false }) }))).data.id
+    assert.deepEqual((await avail(okId)).data, { status: 'ok' })
+    assert.deepEqual((await avail(oldId)).data, { status: 'expired', title: 'Cartel Vencido' })
+    assert.deepEqual((await avail(offId)).data, { status: 'inactive' })
+    assert.deepEqual((await avail(999999)).data, { status: 'missing' })
+    assert.deepEqual((await avail('abc')).data, { status: 'missing' })
+    // un viaje desactivado Y vencido sigue siendo "desactivado"
+    const both = await call(r.viajes.POST, as({ method: 'POST', body: validTrip({ title: 'Doble', active: false, departure: undefined, departures: ['2020-01-01'] }) }))
+    assert.deepEqual((await avail(both.data.id)).data, { status: 'inactive' })
+  })
+  test('la página inyecta las etiquetas del viaje en el index.html de la web', async () => {
+    const { resetShellCache } = await import('../lib/share.js')
+    resetShellCache()
+    globalThis.fetch = async (url) => { fetchCalls += 1; assert.equal(url, 'http://localhost:5173/index.html'); return new Response(SHELL, { status: 200 }) }
+    try {
+      const res = await page(shareId)
+      assert.equal(res.status, 200)
+      const body = res.data
+      assert.equal((body.match(/og:title/g) || []).length, 1, 'no quedan etiquetas duplicadas')
+      assert.equal((body.match(/<title>/g) || []).length, 1)
+      assert.doesNotMatch(body, /general/)
+      assert.match(body, /<title>Chile &quot;&lt;b&gt;mágico&lt;\/b&gt;&quot; &amp; más – Destino Pagina, Chile \| Viajes con Karen<\/title>/)
+      assert.match(body, new RegExp(`og:url" content="http://localhost:5173/viaje/${shareId}"`))
+      assert.match(body, new RegExp(`rel="canonical" href="http://localhost:5173/viaje/${shareId}"`))
+      assert.match(body, /og:image" content="https:\/\/res\.cloudinary\.com\/demo\/image\/upload\/c_fill/)
+      assert.match(body, /content="index, follow, max-image-preview:large"/)
+      assert.match(body, /<script type="module" crossorigin src="\/assets\/index-abc123\.js">/, 'los scripts de la web no se tocan')
+      assert.match(body, /<div id="root"><\/div>/)
+      // segunda visita: usa la copia guardada (no vuelve a pedir el index.html)
+      const before = fetchCalls
+      await page(shareId)
+      assert.equal(fetchCalls, before)
+    } finally { globalThis.fetch = realFetch }
+  })
+  test('vencido, desactivado, inexistente o id inválido: etiquetas generales + noindex', async () => {
+    const { resetShellCache } = await import('../lib/share.js')
+    resetShellCache()
+    globalThis.fetch = async () => new Response(SHELL, { status: 200 })
+    try {
+      const old = (await page(oldId)).data
+      assert.match(old, /<title>Viaje no disponible \| Viajes con Karen<\/title>/)
+      assert.match(old, /noindex/); assert.doesNotMatch(old, /Cartel Vencido/)
+      for (const id of [offId, 999999, 'abc']) {
+        const b = (await page(id)).data
+        assert.match(b, /<title>Viajes con Karen \| /); assert.match(b, /noindex/); assert.doesNotMatch(b, /Secreto Apagado/)
+      }
+    } finally { globalThis.fetch = realFetch }
+  })
+  test('si la web no responde usa la última copia; si nunca la tuvo, 503', async () => {
+    const { resetShellCache } = await import('../lib/share.js')
+    globalThis.fetch = async () => new Response(SHELL, { status: 200 })
+    resetShellCache(); await page(shareId)
+    globalThis.fetch = async () => { throw new Error('caída') }
+    try {
+      // la copia sigue vigente (30 s): responde igual
+      assert.equal((await page(shareId)).status, 200)
+      resetShellCache()
+      const res = await page(shareId)
+      assert.equal(res.status, 503)
+      globalThis.fetch = async () => new Response('<html>no es la web</html>', { status: 200 })
+      assert.equal((await page(shareId)).status, 503, 'un HTML que no es la app no se usa')
+    } finally { globalThis.fetch = realFetch }
   })
 })
 
