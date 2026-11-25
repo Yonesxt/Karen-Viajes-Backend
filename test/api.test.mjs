@@ -32,6 +32,7 @@ const r = {
   disponibilidad: (await import('../app/api/viajes/[id]/disponibilidad/route.js')),
   pagina: (await import('../app/api/pagina/viaje/[id]/route.js')),
   arrepentimiento: (await import('../app/api/arrepentimiento/route.js')),
+  arrepentimientoId: (await import('../app/api/arrepentimiento/[id]/route.js')),
 }
 
 const EMAIL = 'karen@viajesconkaren.com'
@@ -816,6 +817,17 @@ describe('botón de arrepentimiento', () => {
     const ok = await call(r.arrepentimiento.GET, as({}))
     assert.equal(ok.status, 200)
     assert.ok(ok.data.length >= 2)
+    assert.equal(ok.data[0].status, 'nueva')
+  })
+  test('se puede marcar como atendida (solo admin) y no se puede borrar', async () => {
+    const [{ id }] = await psqlQuery('SELECT id FROM withdrawals ORDER BY id LIMIT 1')
+    const params = { id: String(id) }
+    assert.equal((await call(r.arrepentimientoId.PATCH, { method: 'PATCH', body: { status: 'atendida' }, params })).status, 401)
+    const ok = await call(r.arrepentimientoId.PATCH, as({ method: 'PATCH', body: { status: 'atendida' }, params }))
+    assert.equal(ok.status, 200); assert.equal(ok.data.status, 'atendida')
+    assert.equal((await call(r.arrepentimientoId.PATCH, as({ method: 'PATCH', body: { status: 'x' }, params }))).status, 422)
+    assert.equal((await call(r.arrepentimientoId.PATCH, as({ method: 'PATCH', body: { status: 'nueva' }, params: { id: '99999' } }))).status, 404)
+    assert.equal(r.arrepentimientoId.DELETE, undefined)
   })
 })
 
