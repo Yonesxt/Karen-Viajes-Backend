@@ -8,7 +8,7 @@ import { createLimiter } from '../lib/rateLimit.js'
 import { buildCorsHeaders } from '../lib/cors.js'
 import { parseCookies } from '../lib/auth.js'
 import { ALLOWED_FORMATS, createUploadSignature, deleteImage, publicIdFromUrl, signParams } from '../lib/cloudinary.js'
-import { hasErrors, isDate, normalizeDestination, normalizeInquiry, normalizeTrip, validateDestination, validateInquiry, validateOffer, validateTrip } from '../lib/validation.js'
+import { hasErrors, isDate, normalizeDestination, normalizeInquiry, normalizeTrip, normalizeWithdrawal, validateWithdrawal, validateDestination, validateInquiry, validateOffer, validateTrip } from '../lib/validation.js'
 
 test('JWT: firma, verifica, detecta alteraciones, vencimiento y alg=none', () => {
   const t = signToken({ sub: 1, email: 'a@b.com' }, { expiresInSec: 60 })
@@ -210,4 +210,19 @@ test('validación de consultas', () => {
   const n = normalizeInquiry({ name: 'A', source: 'hack', channel: 'paloma', tripId: '5' })
   assert.equal(n.source, 'web'); assert.equal(n.channel, 'formulario'); assert.equal(n.tripId, null)
   assert.equal(hasErrors({}), false)
+})
+
+test('validación del botón de arrepentimiento', () => {
+  const ok = { firstName: 'Ana', lastName: 'Pérez', dni: '30.123.456', email: 'a@b.com', phone: '343 555-1234', bookingCode: 'AB12' }
+  const n = normalizeWithdrawal(ok)
+  assert.equal(n.dni, '30123456')
+  assert.equal(hasErrors(validateWithdrawal(n)), false)
+  const bad = (over) => validateWithdrawal(normalizeWithdrawal({ ...ok, ...over }))
+  assert.ok(bad({ firstName: '' }).firstName)
+  assert.ok(bad({ lastName: 'x'.repeat(81) }).lastName)
+  assert.ok(bad({ dni: '123' }).dni)
+  assert.ok(bad({ email: 'no' }).email)
+  assert.ok(bad({ phone: '' }).phone)
+  assert.ok(bad({ bookingCode: '<script>' }).bookingCode)
+  assert.ok(bad({ bookingCode: 'A' }).bookingCode)
 })

@@ -6,6 +6,7 @@ import { hashPassword } from '../lib/password.js'
 import { upsertAdmin } from '../lib/repo/admins.js'
 import { seedCatalog } from '../lib/seed.js'
 import { psqlQuery } from './helpers/psql-adapter.mjs'
+import { setMailImpl } from '../lib/mailer.js'
 
 const r = {
   health: (await import('../app/api/health/route.js')),
@@ -30,6 +31,7 @@ const r = {
   sitemap: (await import('../app/api/sitemap/route.js')),
   disponibilidad: (await import('../app/api/viajes/[id]/disponibilidad/route.js')),
   pagina: (await import('../app/api/pagina/viaje/[id]/route.js')),
+  arrepentimiento: (await import('../app/api/arrepentimiento/route.js')),
 }
 
 const EMAIL = 'karen@viajesconkaren.com'
@@ -756,6 +758,64 @@ describe('disponibilidad y página del viaje con vista previa en la dirección d
       globalThis.fetch = async () => new Response('<html>no es la web</html>', { status: 200 })
       assert.equal((await page(shareId)).status, 503, 'un HTML que no es la app no se usa')
     } finally { globalThis.fetch = realFetch }
+  })
+})
+
+describe('botón de arrepentimiento', () => {
+  const sent = []
+  let failTo = null
+  setMailImpl(async (m) => {
+    if (failTo && m.to === failTo) return { ok: false, error: 'caído' }
+    sent.push(m)
+    return { ok: true }
+  })
+  const form = (over = {}) => ({ firstName: 'Ana', lastName: 'Pérez', dni: '30.123.456', email: 'ana@mail.com', phone: '+54 9 343 555-1234', bookingCode: 'ABC-123', ...over })
+  const post = (body, ip) => call(r.arrepentimiento.POST, { method: 'POST', body, ip })
+
+  test('guarda la solicitud y manda mail a la agencia y constancia al cliente', async () => {
+    const res = await post(form(), '3.3.3.1')
+    assert.equal(res.status, 201)
+    assert.ok(res.data.id > 0)
+    const toAgency = sent.find((m) => m.to === 'viajesconkaren.asesora@gmail.com')
+    assert.ok(toAgency)
+    assert.equal(toAgency.replyTo, 'ana@mail.com')
+    assert.match(toAgency.text, /30123456/)
+    assert.match(toAgency.text, /ABC-123/)
+    assert.ok(sent.find((m) => m.to === 'ana@mail.com'))
+    const [row] = await psqlQuery('SELECT dni, mail_status FROM withdrawals WHERE id = $1', [res.data.id])
+    assert.equal(row.dni, '30123456'); assert.equal(row.mail_status, 'enviado')
+  })
+  test('si el mail falla la solicitud queda guardada igual (estado fallido)', async () => {
+    failTo = 'viajesconkaren.asesora@gmail.com'
+    const res = await post(form({ bookingCode: 'FALLA-1' }), '3.3.3.2')
+    failTo = null
+    assert.equal(res.status, 201)
+    const [row] = await psqlQuery('SELECT mail_status FROM withdrawals WHERE id = $1', [res.data.id])
+    assert.equal(row.mail_status, 'fallido')
+  })
+  test('valida los datos', async () => {
+    const res = await post(form({ dni: 'abc', email: 'x', bookingCode: '' }), '3.3.3.3')
+    assert.equal(res.status, 422)
+    assert.ok(res.data.fields.dni && res.data.fields.email && res.data.fields.bookingCode)
+  })
+  test('el campo trampa no guarda ni envía nada', async () => {
+    const before = sent.length
+    const res = await post(form({ website: 'http://spam' }), '3.3.3.4')
+    assert.equal(res.status, 201)
+    assert.equal(sent.length, before)
+    const [{ n }] = await psqlQuery(`SELECT count(*)::int AS n FROM withdrawals WHERE booking_code = 'ABC-123'`)
+    assert.equal(n, 1)
+  })
+  test('limita la cantidad de solicitudes por IP', async () => {
+    let last
+    for (let i = 0; i < 6; i++) last = await post(form(), '3.3.3.9')
+    assert.equal(last.status, 429)
+  })
+  test('el listado es solo para el panel', async () => {
+    assert.equal((await call(r.arrepentimiento.GET, {})).status, 401)
+    const ok = await call(r.arrepentimiento.GET, as({}))
+    assert.equal(ok.status, 200)
+    assert.ok(ok.data.length >= 2)
   })
 })
 
