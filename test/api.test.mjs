@@ -32,6 +32,7 @@ const r = {
   disponibilidad: (await import('../app/api/viajes/[id]/disponibilidad/route.js')),
   pagina: (await import('../app/api/pagina/viaje/[id]/route.js')),
   arrepentimiento: (await import('../app/api/arrepentimiento/route.js')),
+  imagen: (await import('../app/api/imagen/route.js')),
   arrepentimientoId: (await import('../app/api/arrepentimiento/[id]/route.js')),
 }
 
@@ -828,6 +829,29 @@ describe('botón de arrepentimiento', () => {
     assert.equal((await call(r.arrepentimientoId.PATCH, as({ method: 'PATCH', body: { status: 'x' }, params }))).status, 422)
     assert.equal((await call(r.arrepentimientoId.PATCH, as({ method: 'PATCH', body: { status: 'nueva' }, params: { id: '99999' } }))).status, 404)
     assert.equal(r.arrepentimientoId.DELETE, undefined)
+  })
+})
+
+describe('proxy de imágenes (historias)', () => {
+  const realFetch = globalThis.fetch
+  const get = (u, ip) => call(r.imagen.GET, { url: `http://localhost:3000/api/imagen?url=${encodeURIComponent(u)}`, ip })
+  test('reenvía solo fotos que están en el catálogo', async () => {
+    const [{ img }] = await psqlQuery(`SELECT images[1] AS img FROM destinations WHERE cardinality(images) > 0 LIMIT 1`)
+    let asked = null
+    globalThis.fetch = async (u) => { asked = String(u); return new Response(Buffer.from([1, 2, 3]), { headers: { 'content-type': 'image/jpeg' } }) }
+    try {
+      const ok = await get(img, '4.4.4.1')
+      assert.equal(ok.status, 200); assert.equal(asked, img)
+      assert.equal(ok.headers.get('content-type'), 'image/jpeg')
+      asked = null
+      assert.equal((await get('https://ejemplo.com/otra.jpg', '4.4.4.2')).status, 404)
+      assert.equal((await get('http://169.254.169.254/latest', '4.4.4.2')).status, 400)
+      assert.equal(asked, null, 'no pidió nada afuera')
+      globalThis.fetch = async () => new Response('<html>', { headers: { 'content-type': 'text/html' } })
+      assert.equal((await get(img, '4.4.4.3')).status, 415)
+      globalThis.fetch = async () => { throw new Error('caído') }
+      assert.equal((await get(img, '4.4.4.3')).status, 502)
+    } finally { globalThis.fetch = realFetch }
   })
 })
 
